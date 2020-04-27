@@ -1,0 +1,190 @@
+Description: 
+  This will deploy the EC2 instance on the private subnets along with launch configurations.
+
+Parameters:
+     EnvironmentName:
+         Description: Env Name that will be prefixed in order to access Variables exported in the stack from Lession 21
+         Type: String
+
+Resources:
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Allow hhtp to Load Balanacer
+      VpcId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+      GroupName: Security Group for Load Balancer
+      SecurityGroupEgress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+   
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Allow http / SSH only from local VPC
+      VpcId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+      GroupName: Security Group for WebServer internal traffic
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash 
+          set -x
+          exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+          apt-get update -y
+          apt install -y awscli apache2 unzip
+          snap install amazon-ssm-agent --classic
+          systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+          cd /var/www/html
+          sudo chmod -R 777 /var/www/html/
+          aws s3 cp s3://udacity-notes-app/index.html .
+          systemctl start apache2.service  
+      ImageId: ami-0d1cd67c26f5fca19  
+      SecurityGroups:
+       - Ref: WebServerSecGroup
+      IamInstanceProfile: !Ref BucketInstanceProfile
+      InstanceType: t3.medium 
+      BlockDeviceMappings:
+       - DeviceName: "/dev/sdk" 
+         Ebs:
+           VolumeSize: 10
+  
+  WebAppALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LBSecGroup
+      Subnets:
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      Tags:
+        - Key: Name
+          Value: LoadBalancer
+      Type: application
+           
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: "4"
+      MaxSize: "4"
+      TargetGroupARNs:
+        - Ref: WebAppTargetGroup   
+
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: 
+            Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppALB
+      Port: 80
+      Protocol: HTTP
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: 'HTTP'
+      VpcId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: '80'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: TargetGroup
+
+  BucketInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: "S3WritableRole"
+  
+  S3WritableRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+  RolePolicies:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - WebAppGroup
+    Properties:
+      PolicyName: WebAppInstancePolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: ['s3:GetObject',
+                "ec2:Describe*"]
+            Resource: '*'
+      Roles:
+        - !Ref S3WritableRole
+  
+Outputs: 
+  WebApp: 
+    Description: A reference to the created Web App
+    Value: !Ref WebAppGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-WebAppGroup
+  WebALB:
+    Description: public url of load balancer
+    Value: !Join [ "", [ "http://", !GetAtt WebAppALB.DNSName, ] ]
+    Export:
+      Name: !Sub ${EnvironmentName}-DNS-NAME
